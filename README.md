@@ -5,8 +5,14 @@
 * Humble Dev CI:   [![Build Status](https://build.ros2.org/job/Hdev__crazyswarm2__ubuntu_jammy_amd64/badge/icon)](https://build.ros2.org/job/Hdev__crazyswarm2__ubuntu_jammy_amd64/)
 
 
-# Crazyswarm2
-A ROS 2-based stack for Bitcraze Crazyflie multirotor robots.
+# Crazyswarm2 real-time SIL baseline
+- stable nine-drone flight at 1000 Hz;
+- custom batched controller;
+- vectorized physics;
+- cached planner;
+- burst stepping;
+- RTF consistently above 1.0;
+- clean Git commit and release tag.
 
 The documentation is available here: https://imrclab.github.io/crazyswarm2/.
 
