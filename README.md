@@ -17,6 +17,7 @@ The current validated configuration simulates **nine Crazyflie drones with 1000 
 
 ---
 
+## Table of Content
 - [Performance](#performance)
 - [Main Changes](#main-changes)
   - [1. Vectorized NumPy physics](#1-vectorized-numpy-physics)
