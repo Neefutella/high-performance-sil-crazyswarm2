@@ -3,3 +3,13 @@ crazyswarm2_sim_webots/
 *.pyc
 *.o
 *~
+
+# Local Crazyflie simulation experiments and rollback snapshots
+crazyflie_sim/.phase*_backups/
+crazyflie_sim/crazyflie_sim/*.before_*
+crazyflie_sim/crazyflie_sim/*.failed_*
+crazyflie_sim/crazyflie_sim/*.upstream
+crazyflie_sim/crazyflie_sim/backend/*.upstream
+crazyflie_sim/crazyflie_sim/backend/cupy_vectorized.py
+**/__pycache__/
+*.py[cod]

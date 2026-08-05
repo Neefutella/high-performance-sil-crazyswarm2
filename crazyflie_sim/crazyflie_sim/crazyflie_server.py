@@ -7,8 +7,13 @@ A crazyflie server for simulation.
     2025 - Updated by Kimberly N. McGuire (Independent)
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import json
+import math
 import importlib
+import os
+import time
 
 from crazyflie_interfaces.msg import FullState, Hover
 from crazyflie_interfaces.srv import GoTo, Land, Takeoff
@@ -16,15 +21,17 @@ from crazyflie_interfaces.srv import NotifySetpointsStop, StartTrajectory, Uploa
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
+import rowan
 from std_msgs.msg import String
 from std_srvs.srv import Empty
-from transforms3d.euler import quat2euler
 
 
 # import BackendRviz from .backend_rviz
 # from .backend import *
 # from .backend.none import BackendNone
 from .crazyflie_sil import CrazyflieSIL, TrajectoryPolynomialPiece
+from .vectorized_cascaded_controller import VectorizedCascadedController
+from .vectorized_setpoint_cache import VectorizedSetpointCache
 from .sim_data_types import State
 
 
@@ -128,6 +135,70 @@ class CrazyflieServer(Node):
                 controller_name,
                 self.backend.time)
 
+        # Parallelize only the independent Mellinger controller calls.
+        if hasattr(os, 'sched_getaffinity'):
+            available_cpus = len(os.sched_getaffinity(0))
+        else:
+            available_cpus = os.cpu_count() or 1
+
+        worker_count = max(1, min(len(self.cfs), available_cpus))
+        self._executor = ThreadPoolExecutor(max_workers=worker_count)
+        self.get_logger().info(
+            f'Controller thread pool started with {worker_count} workers'
+        )
+
+        self._use_vector_controller = os.environ.get(
+            'CF_SIM_VECTOR_CONTROLLER',
+            '1',
+        ).strip().lower() not in ('0', 'false', 'off', 'no')
+        self._vector_controller = (
+            VectorizedCascadedController(self.backend)
+            if self._use_vector_controller
+            else None
+        )
+        self._vector_feedback_counter = 0
+        self._vector_feedback_divider = 10
+        self.get_logger().info(
+            'Controller path: '
+            + (
+                'vectorized cascaded controller'
+                if self._use_vector_controller
+                else 'firmware controller'
+            )
+        )  # CF_SIM_VECTOR_CONTROLLER_PHASE5A
+
+        self._vector_setpoint_cache = (
+            VectorizedSetpointCache(self.backend)
+            if self._use_vector_controller
+            else None
+        )
+        self._vector_vis_counter = 0
+        requested_vis_rate = float(
+            os.environ.get('CF_SIM_VIS_RATE_HZ', '50.0')
+        )
+        if requested_vis_rate <= 0.0:
+            raise ValueError('CF_SIM_VIS_RATE_HZ must be positive')
+        physics_rate = 1.0 / float(self.backend.dt)
+        self._vector_vis_divider = max(
+            1,
+            int(round(physics_rate / requested_vis_rate)),
+        )
+        self.get_logger().info(
+            'Vectorized visualization rate: '
+            f'{physics_rate / self._vector_vis_divider:.1f}Hz'
+        )  # CF_SIM_CACHED_VECTOR_PLANNER_PHASE5B
+
+        self._profile_report_steps = 1000
+        self._profile_steps = 0
+        self._profile_ns = {
+            'setpoint': 0,
+            'controller': 0,
+            'physics': 0,
+            'setstate': 0,
+            'visualization': 0,
+            'total': 0,
+        }
+
         for name, _ in self.cfs.items():
             pub = self.create_publisher(
                     String,
@@ -206,14 +277,48 @@ class CrazyflieServer(Node):
         # Can be used to check if the server is fully available.
         self.create_service(Empty, 'all/emergency', self._emergency_callback)
 
-        # step as fast as possible
+        # Batched formation updates for SIL choreography.
+        # One ROS topic message replaces N synchronous per-drone go_to services.
+        self._formation_last_targets = {}
+        self._formation_frame_count = 0
+        self.create_subscription(
+            String,
+            '/formation_targets',
+            self._formation_targets_callback,
+            1,
+        )
+
+        # Step as fast as possible. Multiple complete simulation steps may
+        # be executed per ROS timer dispatch to amortize rclpy executor
+        # overhead. This does not decimate control or physics.
         max_dt = 0.0 if 'max_dt' not in self._ros_parameters['sim'] \
             else self._ros_parameters['sim']['max_dt']
+
+        try:
+            self._burst_steps = int(
+                os.environ.get('CF_SIM_BURST_STEPS', '4')
+            )
+        except ValueError as exc:
+            raise ValueError(
+                'CF_SIM_BURST_STEPS must be an integer'
+            ) from exc
+
+        if not 1 <= self._burst_steps <= 32:
+            raise ValueError(
+                'CF_SIM_BURST_STEPS must be between 1 and 32'
+            )
+
+        self.get_logger().info(
+            f'Simulation burst size: {self._burst_steps} complete '
+            'step(s) per ROS timer dispatch'
+        )  # CF_SIM_BURST_STEPPING_PHASE5C
+
         self.timer = self.create_timer(max_dt, self._timer_callback)
         self.is_shutdown = False
 
     def on_shutdown_callback(self):
         if not self.is_shutdown:
+            self._executor.shutdown(wait=True)
             self.backend.shutdown()
             for visualization in self.visualizations:
                 visualization.shutdown()
@@ -221,21 +326,137 @@ class CrazyflieServer(Node):
             self.is_shutdown = True
 
     def _timer_callback(self):
-        # update setpoint
-        states_desired = [cf.getSetpoint() for _, cf in self.cfs.items()]
+        for _ in range(self._burst_steps):
+            self._simulation_step()
 
-        # execute the control loop
-        actions = [cf.executeController() for _, cf in self.cfs.items()]
+    def _simulation_step(self):
+        profile_start = time.perf_counter_ns()
 
-        # execute the physics simulator
+        cf_list = list(self.cfs.values())
+
+        setpoint_start = time.perf_counter_ns()
+        desired_arrays = None
+        if self._use_vector_controller:
+            (
+                states_desired,
+                desired_pos,
+                desired_vel,
+                desired_quat,
+            ) = self._vector_setpoint_cache.step(
+                cf_list,
+                self.backend.time(),
+            )
+            desired_arrays = (
+                desired_pos,
+                desired_vel,
+                desired_quat,
+            )
+        else:
+            states_desired = [cf.getSetpoint() for cf in cf_list]
+        setpoint_end = time.perf_counter_ns()
+
+        controller_start = setpoint_end
+        if self._use_vector_controller:
+            actions = self._vector_controller.step_arrays(
+                *desired_arrays,
+                cf_list,
+            )
+        else:
+            actions = [
+                    CrazyflieSIL.executeController(cf)
+                    for cf in cf_list
+                ]  # CF_SIM_CONTROLLER_MODE=serial_direct
+        controller_end = time.perf_counter_ns()
+
+        physics_start = controller_end
         states_next = self.backend.step(states_desired, actions)
+        physics_end = time.perf_counter_ns()
 
-        # update the resulting state
-        for state, (_, cf) in zip(states_next, self.cfs.items()):
-            cf.setState(state)
+        state_start = physics_end
+        if self._use_vector_controller:
+            # The custom controller reads backend arrays directly. Keep the
+            # firmware state synchronized at 100 Hz for command compatibility,
+            # rather than paying nine SWIG conversions every 1 ms step.
+            self._vector_feedback_counter += 1
+            if (
+                self._vector_feedback_counter
+                % self._vector_feedback_divider
+                == 0
+            ):
+                for cf, state in zip(cf_list, states_next):
+                    cf.setState(state)
+        else:
+            for cf, state in zip(cf_list, states_next):
+                cf.setState(state)
+        state_end = time.perf_counter_ns()
 
-        for vis in self.visualizations:
-            vis.step(self.backend.time(), states_next, states_desired, actions)
+        visualization_start = state_end
+        run_visualization = True
+        if self._use_vector_controller:
+            self._vector_vis_counter += 1
+            run_visualization = (
+                self._vector_vis_counter
+                % self._vector_vis_divider
+                == 0
+            )
+
+        if run_visualization:
+            for vis in self.visualizations:
+                vis.step(
+                    self.backend.time(),
+                    states_next,
+                    states_desired,
+                    actions,
+                )
+        visualization_end = time.perf_counter_ns()
+
+        values = {
+            'setpoint': setpoint_end - setpoint_start,
+            'controller': controller_end - controller_start,
+            'physics': physics_end - physics_start,
+            'setstate': state_end - state_start,
+            'visualization': visualization_end - visualization_start,
+            'total': visualization_end - profile_start,
+        }
+
+        for key, value in values.items():
+            self._profile_ns[key] += value
+
+        self._profile_steps += 1
+
+        if self._profile_steps >= self._profile_report_steps:
+            total_ns = max(self._profile_ns['total'], 1)
+            total_ms = total_ns / 1.0e6
+            mean_ms = total_ms / self._profile_steps
+            callback_rate = self._profile_steps / (total_ns / 1.0e9)
+
+            def stage_text(key):
+                stage_ns = self._profile_ns[key]
+                stage_ms = stage_ns / 1.0e6 / self._profile_steps
+                percentage = 100.0 * stage_ns / total_ns
+                return f'{key}={stage_ms:.3f}ms/{percentage:.1f}%'
+
+            self.get_logger().info(
+                'SIM_PROFILE '
+                f'N={len(cf_list)} '
+                f'steps={self._profile_steps} '
+                f'mean={mean_ms:.3f}ms '
+                f'callback_rate={callback_rate:.1f}Hz | '
+                + ' '.join(
+                    stage_text(key)
+                    for key in (
+                        'setpoint',
+                        'controller',
+                        'physics',
+                        'setstate',
+                        'visualization',
+                    )
+                )
+            )
+
+            for key in self._profile_ns:
+                self._profile_ns[key] = 0
+            self._profile_steps = 0
 
     def _param_to_dict(self, param_ros):
         """Turn ROS 2 parameters from the node into a dict."""
@@ -313,6 +534,88 @@ class CrazyflieServer(Node):
 
         return response
 
+
+    def _formation_targets_callback(self, message):
+        # Apply one batched formation frame directly to the SIL planners.
+        try:
+            payload = json.loads(message.data)
+        except (json.JSONDecodeError, TypeError) as error:
+            self.get_logger().warning(
+                f'Ignoring invalid /formation_targets payload: {error}'
+            )
+            return
+
+        targets = payload.get('targets')
+        if not isinstance(targets, dict):
+            self.get_logger().warning(
+                'Ignoring /formation_targets payload without a targets object'
+            )
+            return
+
+        try:
+            duration = float(payload.get('duration', 0.35))
+            yaw = float(payload.get('yaw', 0.0))
+            relative = bool(payload.get('relative', False))
+        except (TypeError, ValueError):
+            self.get_logger().warning(
+                'Ignoring /formation_targets payload with invalid metadata'
+            )
+            return
+
+        duration = min(max(duration, 0.10), 10.0)
+        changed_count = 0
+
+        for name, raw_goal in targets.items():
+            if name not in self.cfs:
+                continue
+
+            if not isinstance(raw_goal, (list, tuple)) or len(raw_goal) != 3:
+                continue
+
+            try:
+                goal = tuple(float(value) for value in raw_goal)
+            except (TypeError, ValueError):
+                continue
+
+            if not all(math.isfinite(value) for value in goal):
+                continue
+
+            previous = self._formation_last_targets.get(name)
+            if previous is not None and max(
+                abs(goal[index] - previous[index]) for index in range(3)
+            ) <= 1.0e-6:
+                continue
+
+            try:
+                self.cfs[name].goTo(
+                    goal,
+                    yaw,
+                    duration,
+                    relative,
+                    0,
+                )
+            except Exception as error:
+                self.get_logger().error(
+                    f'Formation target rejected for {name}: {error}'
+                )
+                continue
+
+            self._formation_last_targets[name] = goal
+            changed_count += 1
+
+        if changed_count:
+            self._formation_frame_count += 1
+            if (
+                self._formation_frame_count == 1
+                or self._formation_frame_count % 100 == 0
+            ):
+                self.get_logger().info(
+                    'Applied batched formation frame '
+                    f'{self._formation_frame_count}: '
+                    f'{changed_count} changed drones, '
+                    f'duration={duration:.3f}s'
+                )
+
     def _notify_setpoints_stop_callback(self, request, response, name='all'):
         self.get_logger().info(f'[{name}] Notify setpoint stop not yet implemented')
         return response
@@ -384,7 +687,7 @@ class CrazyflieServer(Node):
              msg.pose.orientation.x,
              msg.pose.orientation.y,
              msg.pose.orientation.z]
-        rpy = quat2euler(q, axes='rxyz')
+        rpy = rowan.to_euler(q, convention='xyz')
 
         self.cfs[name].cmdFullState(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
